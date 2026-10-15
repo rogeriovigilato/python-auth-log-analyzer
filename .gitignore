@@ -1,0 +1,17 @@
+# Ambiente Python local
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Variáveis locais
+.env
+
+# Relatórios gerados durante a execução
+reports/*.csv
+
+# Backups locais
+*.bak
+*.backup-*
+*.save
+*.save.*
