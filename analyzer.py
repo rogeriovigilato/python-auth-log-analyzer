@@ -1,5 +1,6 @@
 import argparse
 import csv
+import ipaddress
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -16,6 +17,66 @@ LOG_PATTERN = re.compile(
 )
 
 CSV_FIELDS = ["timestamp", "ip", "user", "status"]
+
+CONTROL_CHARACTERS = re.compile(
+    r"[\x00-\x1f\x7f-\x9f"
+    r"\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]"
+)
+
+FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+class LogReadError(Exception):
+    """Falha ao abrir ou ler o arquivo de log."""
+
+
+def escape_character(character):
+    code = ord(character)
+
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+
+    return f"\\u{code:04x}"
+
+
+def sanitize_text(value):
+    """Escapa caracteres de controle e invisíveis."""
+    return CONTROL_CHARACTERS.sub(
+        lambda match: escape_character(match.group()),
+        value,
+    )
+
+
+def sanitize_csv_value(value):
+    """Neutraliza fórmulas e caracteres de controle no CSV."""
+    value = sanitize_text(value)
+
+    if value.startswith(FORMULA_PREFIXES):
+        return "'" + value
+
+    return value
+
+
+def points_to_same_file(path_a, path_b):
+    try:
+        if path_a.samefile(path_b):
+            return True
+    except OSError:
+        pass
+
+    try:
+        return path_a.resolve() == path_b.resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def read_log_lines(log_path):
+    try:
+        with log_path.open(encoding="utf-8") as log_file:
+            for line in log_file:
+                yield line.rstrip("\n")
+    except (OSError, UnicodeError) as error:
+        raise LogReadError(str(error)) from error
 
 
 def positive_int(value):
@@ -91,6 +152,14 @@ def parse_line(line):
     except ValueError:
         return None
 
+    try:
+        ipaddress.ip_address(event["ip"])
+    except ValueError:
+        return None
+
+    event["user"] = sanitize_text(event["user"])
+    event["ip"] = sanitize_text(event["ip"])
+
     return event
 
 
@@ -138,8 +207,8 @@ def write_failures_csv(failures, output_path):
             writer.writerow(
                 {
                     "timestamp": event["timestamp"].isoformat(),
-                    "ip": event["ip"],
-                    "user": event["user"],
+                    "ip": sanitize_csv_value(event["ip"]),
+                    "user": sanitize_csv_value(event["user"]),
                     "status": event["status"],
                 }
             )
@@ -154,59 +223,60 @@ def main():
     if args.output is not None:
         output_path = args.output.expanduser()
 
-        if output_path.resolve() == log_path.resolve():
+        if points_to_same_file(output_path, log_path):
             print(
                 "Erro: o arquivo de saída não pode ser "
                 "o mesmo arquivo de entrada."
             )
             return 1
 
-    try:
-        content = log_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        print(f"Erro ao ler '{log_path}': {error}")
-        return 1
-
-    lines = content.splitlines()
-
     failures = 0
     successes = 0
     unrecognized = 0
+    total_lines = 0
 
     failures_by_ip = defaultdict(list)
     all_failures = []
 
     print(f"Arquivo analisado: {log_path}\n")
 
-    for number, line in enumerate(lines, start=1):
-        event = parse_line(line)
+    try:
+        for number, line in enumerate(
+            read_log_lines(log_path),
+            start=1,
+        ):
+            total_lines = number
+            event = parse_line(line)
 
-        if event is None:
-            unrecognized += 1
+            if event is None:
+                unrecognized += 1
+                print(
+                    f"Linha {number}: formato não reconhecido, "
+                    "data ou IP inválidos"
+                )
+                continue
+
+            if event["status"] == "Failed":
+                failures += 1
+                failures_by_ip[event["ip"]].append(event)
+                all_failures.append(event)
+                result = "FALHA"
+            else:
+                successes += 1
+                result = "SUCESSO"
+
             print(
-                f"Linha {number}: "
-                "formato não reconhecido ou data inválida"
+                f"{result} | "
+                f"Horário: {event['timestamp'].isoformat()} | "
+                f"Usuário: {event['user']} | "
+                f"IP: {event['ip']}"
             )
-            continue
-
-        if event["status"] == "Failed":
-            failures += 1
-            failures_by_ip[event["ip"]].append(event)
-            all_failures.append(event)
-            result = "FALHA"
-        else:
-            successes += 1
-            result = "SUCESSO"
-
-        print(
-            f"{result} | "
-            f"Horário: {event['timestamp'].isoformat()} | "
-            f"Usuário: {event['user']} | "
-            f"IP: {event['ip']}"
-        )
+    except LogReadError as error:
+        print(f"Erro ao ler '{log_path}': {error}")
+        return 1
 
     print("\nResumo:")
-    print(f"Total de linhas: {len(lines)}")
+    print(f"Total de linhas: {total_lines}")
     print(f"Falhas de autenticação: {failures}")
     print(f"Autenticações bem-sucedidas: {successes}")
     print(f"Linhas não reconhecidas: {unrecognized}")
@@ -269,6 +339,15 @@ def main():
     print("Observação: o alerta não confirma um ataque.")
 
     if output_path is not None:
+        # Reconfere logo antes de escrever para reduzir a janela
+        # de troca do caminho entre a checagem e a escrita.
+        if points_to_same_file(output_path, log_path):
+            print(
+                "\nErro: o arquivo de saída não pode ser "
+                "o mesmo arquivo de entrada."
+            )
+            return 1
+
         try:
             write_failures_csv(all_failures, output_path)
         except (OSError, UnicodeError) as error:
