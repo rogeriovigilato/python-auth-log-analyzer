@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from analyzer import (
+    AlertTracker,
+    FailureCsvWriter,
     find_suspicious_window,
+    match_line,
     parse_line,
     write_failures_csv,
 )
@@ -25,13 +28,21 @@ def make_events(minutes):
     ]
 
 
-def make_failure(user="admin", ip="192.0.2.10"):
+def make_failure(user="admin", ip="192.0.2.10", minute=0):
     return {
-        "timestamp": datetime(2026, 10, 9, 14, 0, 0),
+        "timestamp": datetime(2026, 10, 9, 14, 0, 0)
+        + timedelta(minutes=minute),
         "status": "Failed",
         "user": user,
         "ip": ip,
     }
+
+
+ISO_VM_LINE = (
+    "2026-10-14T20:00:12.183014-03:00 host sshd[2421]: "
+    "Failed password for invalid user admin "
+    "from 203.0.113.77 port 51201 ssh2"
+)
 
 
 class TestSuspiciousWindow(unittest.TestCase):
@@ -159,6 +170,125 @@ class TestParseLine(unittest.TestCase):
         self.assertEqual(event["user"], "\\x1b[31mroot")
 
 
+class TestFormats(unittest.TestCase):
+    def test_iso_with_microseconds_and_offset(self):
+        event = parse_line(ISO_VM_LINE)
+
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event["timestamp"],
+            datetime(2026, 10, 14, 20, 0, 12, 183014),
+        )
+        self.assertEqual(event["ip"], "203.0.113.77")
+
+    def test_iso_offset_without_colon(self):
+        line = (
+            "2026-10-14T20:00:12+0000 host sshd[2421]: "
+            "Failed password for admin from 203.0.113.77 "
+            "port 51201 ssh2"
+        )
+
+        event = parse_line(line)
+
+        self.assertEqual(
+            event["timestamp"],
+            datetime(2026, 10, 14, 20, 0, 12),
+        )
+
+    def test_classic_syslog_uses_reference_year(self):
+        line = (
+            "Oct  9 14:00:00 lab-linux sshd[1201]: "
+            "Failed password for admin from 192.0.2.10 "
+            "port 51001 ssh2"
+        )
+
+        event = parse_line(line, reference=datetime(2026, 10, 16))
+
+        self.assertEqual(
+            event["timestamp"],
+            datetime(2026, 10, 9, 14, 0, 0),
+        )
+
+    def test_classic_syslog_rolls_back_over_new_year(self):
+        line = (
+            "Dec 31 23:59:00 lab-linux sshd[1201]: "
+            "Failed password for admin from 192.0.2.10 "
+            "port 51001 ssh2"
+        )
+
+        event = parse_line(line, reference=datetime(2026, 1, 2))
+
+        self.assertEqual(
+            event["timestamp"],
+            datetime(2025, 12, 31, 23, 59, 0),
+        )
+
+    def test_publickey_failure_is_parsed(self):
+        line = (
+            "2026-10-14T20:00:12+00:00 host sshd[2421]: "
+            "Failed publickey for postgres from 203.0.113.77 "
+            "port 51201 ssh2"
+        )
+
+        event = parse_line(line)
+
+        self.assertEqual(event["status"], "Failed")
+        self.assertEqual(event["user"], "postgres")
+
+    def test_match_line_reports_the_format_name(self):
+        name, event = match_line(ISO_VM_LINE)
+
+        self.assertEqual(name, "iso")
+        self.assertIsNotNone(event)
+
+        name, event = match_line(
+            "Oct  9 14:00:00 lab-linux sshd[1201]: "
+            "Failed password for admin from 192.0.2.10 "
+            "port 51001 ssh2",
+            reference=datetime(2026, 10, 16),
+        )
+
+        self.assertEqual(name, "syslog")
+
+        self.assertEqual(match_line("linha invalida"), (None, None))
+
+
+class TestAlertTracker(unittest.TestCase):
+    def test_threshold_inside_window_alerts(self):
+        tracker = AlertTracker(threshold=5, window_minutes=10)
+
+        results = [
+            tracker.add_failure(make_failure(minute=minute))
+            for minute in range(5)
+        ]
+
+        self.assertIsNone(results[3])
+        self.assertEqual(len(results[4]), 5)
+
+    def test_repeats_alert_only_after_window_rolls(self):
+        tracker = AlertTracker(threshold=2, window_minutes=10)
+
+        self.assertIsNone(tracker.add_failure(make_failure(minute=0)))
+        self.assertIsNotNone(
+            tracker.add_failure(make_failure(minute=1))
+        )
+        self.assertIsNone(tracker.add_failure(make_failure(minute=2)))
+        self.assertIsNone(tracker.add_failure(make_failure(minute=21)))
+        self.assertIsNotNone(
+            tracker.add_failure(make_failure(minute=22))
+        )
+
+    def test_pruning_keeps_memory_bounded(self):
+        tracker = AlertTracker(threshold=5, window_minutes=10)
+
+        for minute in range(0, 120, 3):
+            tracker.add_failure(make_failure(minute=minute))
+
+        stored = tracker.events_by_ip["192.0.2.10"]
+
+        self.assertLessEqual(len(stored), 4)
+
+
 class TestCsvExport(unittest.TestCase):
     def export_single_failure(self, user):
         with tempfile.TemporaryDirectory() as directory:
@@ -199,6 +329,27 @@ class TestCsvExport(unittest.TestCase):
         self.assertEqual(rows[0]["user"], "admin")
         self.assertEqual(rows[0]["ip"], "192.0.2.10")
         self.assertEqual(rows[0]["status"], "Failed")
+
+
+class TestFailureCsvWriter(unittest.TestCase):
+    def test_writes_rows_incrementally(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "result.csv"
+            writer = FailureCsvWriter(output_path)
+
+            writer.write(make_failure(user="=2+2"))
+            writer.write(make_failure(user="admin"))
+            writer.close()
+
+            with output_path.open(
+                encoding="utf-8",
+                newline="",
+            ) as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["user"], "'=2+2")
+        self.assertEqual(rows[1]["user"], "admin")
 
 
 if __name__ == "__main__":

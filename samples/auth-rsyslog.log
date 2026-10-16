@@ -1,0 +1,6 @@
+2026-10-14T20:00:12.183014-03:00 rogerio-VMware-Virtual-Platform sshd[2421]: Failed password for invalid user admin from 203.0.113.77 port 51201 ssh2
+2026-10-14T20:01:05.283014-03:00 rogerio-VMware-Virtual-Platform sshd[2422]: Failed password for invalid user admin from 203.0.113.77 port 51202 ssh2
+2026-10-14T20:02:44.383014-03:00 rogerio-VMware-Virtual-Platform sshd[2423]: Failed password for root from 203.0.113.77 port 51203 ssh2
+2026-10-14T20:03:31.483014-03:00 rogerio-VMware-Virtual-Platform sshd[2424]: Failed password for root from 203.0.113.77 port 51204 ssh2
+2026-10-14T20:04:02.583014-03:00 rogerio-VMware-Virtual-Platform sshd[2425]: Failed publickey for postgres from 203.0.113.77 port 51205 ssh2
+2026-10-14T20:05:19.683014-03:00 rogerio-VMware-Virtual-Platform sshd[2426]: Accepted password for roger from 192.168.1.50 port 51300 ssh2
